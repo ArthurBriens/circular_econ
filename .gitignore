@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# IDE / tooling
+.idea/
+.vscode/
+.claude/
+
+# Streamlit
+# secrets.toml must NEVER be committed -- it holds API keys and, if you later
+# add st.login(), the OIDC client secret and cookie secret.
+# config.toml (theme only, no secrets) SHOULD be committed.
+.streamlit/secrets.toml
+
+# OS
+.DS_Store
+
+# Generated EDA outputs -- regenerable from code/, so kept out of the repo.
+# Delete these two lines if you want the figures versioned.
+output/figure/
+output/table/

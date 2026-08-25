@@ -1,0 +1,16 @@
+# Streamlit chrome, aligned with the dashboard palette in
+# output/dashboard/lib/theme.py. Without this, Streamlit's default red accent
+# fights the validated blue categorical ramp in every chart.
+#
+# Applies to the whole app, including the existing pages. Delete this file to
+# fall back to Streamlit defaults.
+
+[theme]
+primaryColor = "#2a78d6"
+backgroundColor = "#f9f9f7"
+secondaryBackgroundColor = "#fcfcfb"
+textColor = "#0b0b0b"
+font = "sans serif"
+
+[browser]
+gatherUsageStats = false
