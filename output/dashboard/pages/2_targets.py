@@ -144,17 +144,23 @@ if df.empty:
 # shared chart builders
 # --------------------------------------------------------------------------
 
-def label_of(r, limit: int = 62) -> str:
-    """Row label: sector first, because that is what the eye scans for.
-
-    Truncated -- Plotly grows the left margin to fit the longest tick label, so
-    an untruncated metric name silently squeezes the plot area to nothing.
-    """
-    s = f"{r['sector']} - {r['metric']}"
-    return s if len(s) <= limit else s[: limit - 1] + "…"
+_LABEL_LEFT_MARGIN = 230  # px — must match the char limits below
+#   sector: 22 chars × ~7 px = 154 px
+#   metric: 30 chars × ~7 px = 210 px  →  add ~20 px padding → 230 px
 
 
-def horizon_chart(sub, row_px: int = 30):
+def label_of(r, sector_limit: int = 22, metric_limit: int = 30) -> str:
+    """Two-line row label: sector on the first line, metric on the second."""
+    sector = r["sector"]
+    if len(sector) > sector_limit:
+        sector = sector[: sector_limit - 1] + "…"
+    metric = r["metric"]
+    if len(metric) > metric_limit:
+        metric = metric[: metric_limit - 1] + "…"
+    return f"{sector}<br>{metric}"
+
+
+def horizon_chart(sub, row_px: int = 52):
     """Dumbbell: baseline year -> target year.
 
     Time is the one axis France and Brazil genuinely share. Even when the
@@ -168,8 +174,9 @@ def horizon_chart(sub, row_px: int = 30):
     if sub.empty:
         return None
     sub["label"] = sub.apply(label_of, axis=1)
+    sub["full_label"] = sub["sector"] + " — " + sub["metric"]
     sub = sub.sort_values("target_year")
-    height = 110 + row_px * len(sub)
+    height = 120 + row_px * len(sub)
 
     fig = go.Figure()
     for _, r in sub.iterrows():
@@ -185,20 +192,24 @@ def horizon_chart(sub, row_px: int = 30):
             x=part["baseline_year"], y=part["label"], mode="markers", showlegend=False,
             marker=dict(size=9, color=P["surface"],
                         line=dict(color=COUNTRY_COLOUR[country], width=2)),
-            hovertemplate="%{y}<br>Baseline year: %{x:.0f}<extra></extra>",
+            customdata=part[["full_label"]],
+            hovertemplate="%{customdata[0]}<br>Baseline year: %{x:.0f}<extra></extra>",
         )
         fig.add_scatter(
             x=part["target_year"], y=part["label"], mode="markers", name=country,
             marker=dict(size=10, color=COUNTRY_COLOUR[country],
                         line=dict(color=P["surface"], width=2)),
-            hovertemplate="%{y}<br>Target year: %{x:.0f}<extra></extra>",
+            customdata=part[["full_label"]],
+            hovertemplate="%{customdata[0]}<br>Target year: %{x:.0f}<extra></extra>",
         )
     fig.update_layout(xaxis=dict(title="", dtick=5, tickangle=0),
                       yaxis=dict(showgrid=False, autorange="reversed"))
-    return chart(fig, height)
+    fig = chart(fig, height)
+    fig.update_layout(margin=dict(l=_LABEL_LEFT_MARGIN))
+    return fig
 
 
-def progress_chart(sub, row_px: int = 30):
+def progress_chart(sub, row_px: int = 52):
     """Bullet bars: where the metric stands now, against its own target.
 
     Each row is scored against ITS OWN target, so no cross-country axis
@@ -211,10 +222,11 @@ def progress_chart(sub, row_px: int = 30):
     sub = sub.dropna(subset=["latest_value", "target_value"]).copy()
     if sub.empty:
         return None
-    height = 110 + row_px * len(sub)
+    height = 120 + row_px * len(sub)
     sub["lower_better"] = sub["metric_family"].isin(TG.LOWER_IS_BETTER)
     sub["label"] = sub.apply(
         lambda r: ("↓ " if r["lower_better"] else "") + label_of(r), axis=1)
+    sub["full_label"] = sub["sector"] + " — " + sub["metric"]
     sub = sub.sort_values("target_year")
 
     fig = go.Figure()
@@ -227,23 +239,36 @@ def progress_chart(sub, row_px: int = 30):
             y=part["label"], x=part["latest_value"], orientation="h", name=country,
             marker_color=COUNTRY_COLOUR[country], width=0.5,
             text=[f"{v:,.0f} %" for v in part["latest_value"]],
-            textposition="outside", textfont=dict(color=P["text_primary"], size=11),
-            customdata=part[["target_value", "target_year", "basis"]],
-            hovertemplate=("%{y}<br>Latest: %{x:,.1f} %"
-                           "<br>Target: %{customdata[0]:,.1f} % by %{customdata[1]:.0f}"
+            textposition="outside", textfont=dict(color=P["text_primary"], size=12),
+            cliponaxis=False,
+            customdata=part[["target_value", "target_year", "basis", "full_label"]],
+            hovertemplate=("%{customdata[3]}"
+                           "<br>Latest: %{x:,.1f} %"
+                           "<br>Target: %{customdata[0]:,.1f} %"
+                           "<br>By year: %{customdata[1]:.0f}"
                            "<br>Basis: %{customdata[2]}<extra></extra>"),
         )
     # target ticks: colour set explicitly, or the colorway supplies a status hue
     fig.add_scatter(
         x=sub["target_value"], y=sub["label"], mode="markers",
-        marker=dict(symbol="line-ns-open", size=22, color=P["text_primary"],
+        marker=dict(symbol="line-ns-open", size=24, color=P["text_primary"],
                     line=dict(color=P["text_primary"], width=2)),
-        name="Target", hovertemplate="%{y}<br>Target: %{x:,.1f} %<extra></extra>",
+        name="Target",
+        customdata=sub[["target_year", "basis", "full_label"]],
+        hovertemplate=("%{customdata[2]}"
+                       "<br><b>Target: %{x:,.1f} %</b>"
+                       "<br>By year: %{customdata[0]:.0f}"
+                       "<br>Basis: %{customdata[1]}<extra></extra>"),
     )
     fig.update_layout(barmode="overlay",
-                      xaxis=dict(range=[0, 108], ticksuffix=" %"),
+                      xaxis=dict(range=[0, 120], ticksuffix=" %"),
                       yaxis=dict(showgrid=False, autorange="reversed"))
-    return chart(fig, height)
+    fig = chart(fig, height)
+    # l: explicit fixed margin so labels aren't clipped (automargin loses to
+    #    chart()'s margin.l=8 in Streamlit's iframe context)
+    # r: room for "100 %" outside-text labels
+    fig.update_layout(margin=dict(l=_LABEL_LEFT_MARGIN, r=52))
+    return fig
 
 
 # ==========================================================================
