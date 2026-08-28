@@ -27,9 +27,9 @@ venv/
 # data.ademe.fr at any time, and would grow git history every time they are
 # refreshed. The deployed app gets them from the URLs in st.secrets instead
 # (see secrets.toml.example).
-data/raw/REP.csv
-data/raw/traitements_REP.csv
-data/raw/Referentiels_MSM.xlsx
+#data/raw/REP.csv
+#data/raw/traitements_REP.csv
+#data/raw/Referentiels_MSM.xlsx
 
 # data/raw/targets_fr_br.csv is deliberately NOT ignored. It is 84 KB of
 # hand-assembled, individually sourced research rather than a bulk download,

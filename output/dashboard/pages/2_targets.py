@@ -264,7 +264,7 @@ else:
     # full width, stacked rather than side by side: these y labels are long, and
     # Plotly reserves left margin for the longest one, so in a half-width column
     # the plot area collapses and the outside value labels get clipped
-    st.subheader("When each commitment bites")
+    st.subheader("What date ate commitments set for")
     st.caption("Hollow marker = baseline year, filled = target year. Time is "
                "the one axis both countries genuinely share, so this chart "
                "needs no comparability caveat.")
