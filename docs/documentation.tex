@@ -1,0 +1,723 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+\usepackage{longtable}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+
+% --- light code styling, nothing fancy -------------------------------------
+\definecolor{codebg}{gray}{0.96}
+\definecolor{codecomment}{gray}{0.45}
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  backgroundcolor=\color{codebg},
+  commentstyle=\color{codecomment}\itshape,
+  keywordstyle=\bfseries,
+  breaklines=true,
+  frame=none,
+  showstringspaces=false,
+  columns=fullflexible,
+  xleftmargin=8pt,
+  aboveskip=8pt,
+  belowskip=8pt,
+}
+\lstdefinestyle{py}{language=Python}
+\lstdefinestyle{sh}{language=bash}
+
+\newcommand{\file}[1]{\texttt{#1}}
+\setlist{itemsep=2pt, parsep=0pt, topsep=4pt}
+
+\title{Circularity Dashboard\\
+\large A France--Brazil comparison of Extended Producer Responsibility\\[4pt]
+\normalsize Code and data documentation}
+\author{Arthur Briens \\ \small USP--PSL Institute for Circular Economy}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+This document explains how the circularity dashboard is built: what each file
+does, why it is written the way it is, and which traps in the underlying data
+the code is deliberately defending against. It is written to be read by someone
+who has not seen the code before, and to be useful again in six months when the
+reasoning behind a particular line has been forgotten. Sections~\ref{sec:run}
+and~\ref{sec:model} are the ones to read first; the rest can be consulted as
+reference.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+% ===========================================================================
+\section{What this project is}
+
+The dashboard compares how France and Brazil regulate the circular economy. It
+has three substantive pages:
+
+\begin{itemize}
+  \item \textbf{Targets} --- what each country has committed to, in law, and how
+        far it has got.
+  \item \textbf{EPR market structure} --- how concentrated the French compliance
+        market is: monopoly, duopoly or oligopoly, filière by filière.
+  \item \textbf{France, EPR filières} --- tonnages placed on the market and
+        treated, by filière, eco-organisme and region.
+\end{itemize}
+
+It is a Streamlit application written in Python, reading ADEME open data for the
+French side and a hand-assembled, sourced CSV for the targets comparison.
+
+\subsection{The one idea behind the whole thing}
+
+France and Brazil do not set targets on the same footing, and the easiest way to
+produce a misleading comparison is to put two percentages on one axis when their
+denominators differ. France measures WEEE collection as 65\,\% of a rolling
+three-year average of equipment placed on the market. Brazil measures it as
+17\,\% of product weight against a fixed 2018 base year. Both are ``a
+percentage of what was put on the market'', both can be plotted as a bar, and
+they are not the same quantity.
+
+Almost every design decision in this codebase follows from taking that problem
+seriously. The data model carries a \file{basis} field (the denominator, written
+out in words) alongside every number, and the charts refuse to place two
+countries on a shared axis unless their bases actually match.
+
+% ===========================================================================
+\section{Getting it running}\label{sec:run}
+
+\subsection{Locally}
+
+From the project root:
+
+\begin{lstlisting}[style=sh]
+pip install -r requirements.txt
+streamlit run output/dashboard/app.py
+\end{lstlisting}
+
+The app opens in a browser. The three pages appear in the left-hand navigation,
+which Streamlit builds automatically from the files in
+\file{output/dashboard/pages/}. The numeric prefix in \file{2\_targets.py} sets
+the ordering; it is not part of the page name.
+
+\subsection{Deployed}
+
+The app is deployed on Streamlit Community Cloud from a private GitHub
+repository. The entry point is \file{output/dashboard/app.py}. Cloud rebuilds
+from a fresh clone on every push.
+
+\subsection{Where the data comes from}\label{sec:sources}
+
+The three ADEME extracts are deliberately \emph{not} committed to git; the
+targets CSV \emph{is}. The line drawn is \textbf{third-party bulk extracts out,
+our own research in} --- the ADEME files total roughly 4.5\,MB and are
+redownloadable at any time, whereas \file{targets\_fr\_br.csv} is 84\,KB of
+hand-assembled, individually sourced rows that the targets page needs in order
+to be reproducible from a clone.
+
+Either way, each file is resolved in two steps:
+
+\begin{enumerate}
+  \item \file{data/raw/<filename>} --- the local working copy, used in
+        development;
+  \item a URL held in \file{st.secrets["data"]} --- used by the deployed app.
+\end{enumerate}
+
+A fresh clone contains the targets CSV but none of the ADEME extracts, so those
+fall through to the secrets URL. Configure them on Streamlit Cloud under
+\textbf{Manage app $\rightarrow$ Settings $\rightarrow$ Secrets}:
+
+\begin{lstlisting}
+[data]
+msm_url     = "https://.../REP.csv"
+trt_url     = "https://.../traitements_REP.csv"
+ref_url     = "https://.../Referentiels_MSM.xlsx"
+targets_url = "https://.../targets_fr_br.csv"   # optional: overrides the
+                                                # committed copy
+\end{lstlisting}
+
+Locally the same block goes in \file{.streamlit/secrets.toml}, which is
+gitignored. \file{secrets.toml.example} at the repository root documents the
+shape and is safe to commit.
+
+\paragraph{These URLs are credentials.} A pre-signed S3 link or a share link
+with an embedded token grants read access to whoever holds it. They must never
+enter git, a log line, or an error message. \file{lib/data.py} contains a
+\file{\_scrub()} helper whose only job is to strip URLs out of exception text
+before it is displayed, because an error message is the easy way to leak one.
+
+% ===========================================================================
+\section{The mental model}\label{sec:model}
+
+Two ideas explain most of the code. Neither is obvious from reading it.
+
+\subsection{Streamlit re-runs the whole script}
+
+Streamlit re-executes the \emph{entire page script, top to bottom, on every
+interaction}. Move a slider and the file runs again from line 1. There is no
+callback system and no component tree that persists between interactions.
+
+Three consequences follow, and they explain a lot:
+
+\begin{itemize}
+  \item \textbf{Widgets are just values.} \file{dark = st.toggle(...)} returns a
+        plain boolean for this run. There is no state plumbing.
+  \item \textbf{Expensive work must be cached}, or a 2.6\,MB CSV is re-read on
+        every click. Hence \file{@st.cache\_data} on every loader.
+  \item \textbf{Declaration order is render order.} A control created after
+        \file{st.columns()} appears \emph{below} the charts it drives. This
+        caused a real bug: the ``filière in focus'' selector rendered under the
+        charts it controlled until it was moved above the column split.
+\end{itemize}
+
+\subsection{The visual layer is three tiers that do not overlap}
+
+Styling a Streamlit app reaches different places depending on which lever you
+pull, and it is worth knowing which is which.
+
+\begin{longtable}{@{}L{3.9cm}L{5.0cm}L{5.4cm}@{}}
+\toprule
+\textbf{Tier} & \textbf{Reaches} & \textbf{Limitation} \\
+\midrule
+\endhead
+\file{.streamlit/}\newline\file{config.toml} &
+Streamlit's own widgets: sidebar, sliders, multiselects, buttons &
+Read once at server start. \emph{Static} --- cannot respond to anything in the
+script \\
+\addlinespace
+Plotly template
+(\file{lib/theme.py}) &
+Axis colours, gridlines, fonts, hover styling, legend placement, the
+categorical colour order &
+Only applies to figures, and Streamlit will override parts of it unless told
+not to (see below) \\
+\addlinespace
+Injected CSS
+(\file{theme.page\_css}) &
+Metric cards, the hero number, section labels, chart card backgrounds, text
+colour in dark mode &
+Targets Streamlit's internal \file{data-testid} attributes, which can change
+between versions. The fragile tier --- kept to a handful of rules \\
+\bottomrule
+\end{longtable}
+
+\paragraph{The seam.} Because tier~1 is static and tiers~2--3 are dynamic, the
+in-app dark-mode toggle changes the charts and cards but \emph{not} Streamlit's
+sidebar and widgets. That is a genuine half-measure. Making it complete would
+mean setting \file{base = "dark"} in \file{config.toml}, which is an app-wide,
+restart-level setting rather than a per-session toggle.
+
+\paragraph{Two Plotly traps, both discovered the hard way.}
+\begin{enumerate}
+  \item \file{st.plotly\_chart} defaults to \file{theme="streamlit"}, which
+        overrides your registered template. Every call in this codebase passes
+        \file{theme=None}.
+  \item Even then, Streamlit merges \file{config.toml}'s colours over the
+        figure's \emph{template} values, because template values count as
+        defaults. Only an explicit value on the figure's own layout wins that
+        merge. So every chart helper sets
+        \file{paper\_bgcolor} and \file{plot\_bgcolor} explicitly. Without this,
+        dark mode rendered every plot area white under a dark page.
+\end{enumerate}
+
+% ===========================================================================
+\section{Repository map}
+
+\begin{longtable}{@{}L{5.6cm}rL{7.2cm}@{}}
+\toprule
+\textbf{Path} & \textbf{Lines} & \textbf{Role} \\
+\midrule
+\endhead
+\file{output/dashboard/app.py} & 95 & Landing page. Project description and
+links to the three pages \\
+\file{lib/\_\_init\_\_.py} & 1 & Makes \file{lib} a package \\
+\file{lib/data.py} & 514 & Source resolution, ADEME loaders, French transforms \\
+\file{lib/market.py} & 314 & Market-structure measures (monopoly/oligopoly) \\
+\file{lib/targets.py} & 549 & Targets schema, placeholder set, loader, pairing \\
+\file{lib/theme.py} & 206 & Palette, Plotly templates, page CSS \\
+\file{pages/2\_targets.py} & 492 & France vs Brazil target comparison \\
+\file{pages/3\_EPR.py} & 568 & EPR market structure \\
+\file{pages/4\_France\_EPR.py} & 446 & France filière detail \\
+\midrule
+\file{data/raw/REP.csv} & 1.8\,MB & Put-on-market declarations, 2017--2024 \\
+\file{data/raw/traitements\_REP.csv} & 2.6\,MB & Treated-waste declarations \\
+\file{data/raw/Referentiels\_MSM.xlsx} & 76\,KB & Actor and filière lookups \\
+\file{data/raw/targets\_fr\_br.csv} & 81\,KB & 194 researched targets \\
+\midrule
+\file{docs/targets\_csv\_schema.md} & --- & Specification for the targets CSV \\
+\file{requirements.txt} & --- & pandas, openpyxl, streamlit, plotly \\
+\file{secrets.toml.example} & --- & Template for the data-source URLs \\
+\file{.streamlit/config.toml} & --- & Streamlit theme (accent colour, fonts) \\
+\file{code/*.py} & --- & Earlier exploratory analysis, not used by the app \\
+\bottomrule
+\end{longtable}
+
+The split is deliberate: \file{lib/} contains everything that touches pandas and
+nothing that touches presentation; \file{pages/} contains composition and almost
+no data logic. A practical benefit is that you can debug a chart without
+launching Streamlit at all:
+
+\begin{lstlisting}[style=py]
+from lib import data as D, market as M
+panel = M.actor_panel(D.load_msm(), D.load_actors())
+M.structure(panel).query("filiere == 'EEE'")
+\end{lstlisting}
+
+\newpage
+% ===========================================================================
+\section{The library layer}
+
+\subsection{\file{lib/data.py} --- getting the ADEME data in}
+
+Three responsibilities: find the files, load them, reshape them.
+
+\subsubsection*{Finding the files}
+
+A small \file{Source} dataclass names each required file, its expected local
+filename, and its key in the secrets table. \file{\_open(key)} returns either a
+\file{Path} or an in-memory buffer, and pandas accepts both, so the loaders do
+not care which they got.
+
+\file{require\_data()} is called at the top of every page that needs data. It
+does two things, both about failing legibly:
+
+\begin{enumerate}
+  \item checks that each source is configured, and if not, prints a message
+        naming the missing file and both ways to fix it;
+  \item \emph{primes} the loaders inside a \file{try}, so that a download that
+        times out or returns 403 is reported here rather than surfacing deep
+        inside a chart.
+\end{enumerate}
+
+This matters because Streamlit Community Cloud \textbf{redacts exception text}
+to avoid leaking data. An unguarded pandas error reaches the user as ``the
+original error message is redacted'' with no indication of which file is
+missing --- which is exactly the failure this project hit in deployment.
+
+\file{require\_data()} is deliberately \emph{not} cached: \file{st.stop()} raises
+a control-flow exception, and caching a function that raises it would poison the
+cache entry.
+
+\subsubsection*{Path resolution}
+
+\begin{lstlisting}[style=py]
+ROOT = Path(__file__).resolve().parents[3]   # lib -> dashboard -> output -> repo
+RAW  = ROOT / "data" / "raw"
+\end{lstlisting}
+
+Paths resolve from the file, not the working directory. A relative
+\file{"data/raw/REP.csv"} only works when the app happens to be launched from
+the project root, which is not guaranteed on a host.
+
+\subsubsection*{Reshaping, and the traps it defends against}
+
+The transform functions each return a tidy frame shaped for exactly one chart.
+Three defensive details are worth knowing, because each was a real bug:
+
+\begin{itemize}
+  \item \textbf{\file{type\_ton} is null for most filières.} Any \file{groupby}
+        or merge on it silently drops EEE, TLC and EA. It is filled with
+        \file{"N/A"} before it is ever used as a key.
+  \item \textbf{\file{pays\_site\_trt} is null for all EMPAP rows.} Treating
+        null as ``not France'' rendered EMPAP as 100\,\% exported, which is
+        nonsense. The field is now three-state: France, abroad, or
+        \emph{not declared}.
+  \item \textbf{\file{reg\_site\_trt} uses pre-2016 region codes} --- 22
+        régions, not the current 13. \file{LEGACY\_REGION} maps them across.
+\end{itemize}
+
+\subsection{\file{lib/theme.py} --- one visual system}
+
+Pure parameters, no data knowledge. Two palette dictionaries (light and dark), a
+Plotly template factory, and a CSS string builder.
+
+The categorical colour order is validated for colour-vision deficiency in both
+modes. \textbf{The order is the safety mechanism, not decoration.} An attempt to
+re-order the palette so that two particular hues were not adjacent failed
+validation badly in dark mode, and was reverted.
+
+Three colour roles, and mixing them up is the most common way a chart goes
+wrong:
+
+\begin{itemize}
+  \item \textbf{Categorical} --- identity, no order. Countries, eco-organismes.
+  \item \textbf{Ordinal} --- ranked categories. The waste hierarchy; the
+        monopoly-to-oligopoly scale. Darkest is ``most concentrated''.
+  \item \textbf{Sequential} --- continuous magnitude. Heatmaps only.
+\end{itemize}
+
+Status colours (good/warning/critical) are reserved and never reused as a
+series colour. This matters in practice: Plotly assigns marker colour from the
+colourway if you do not specify one, so target markers silently came out green
+--- reading as ``good'' next to a chart about missing targets --- until they
+were coloured explicitly.
+
+\subsection{\file{lib/market.py} --- monopoly, duopoly, oligopoly}
+
+A REP filière is a regulated market: producers must join an eco-organisme or run
+an approved individual system, so the declarants in \file{REP.csv} are that
+market's suppliers of compliance. The standard industrial-organisation toolkit
+therefore applies.
+
+\paragraph{Two classifications, deliberately.}
+
+\begin{itemize}
+  \item \textbf{Structure} counts declarants: monopoly (1), duopoly (2), tight
+        oligopoly (3--4), broad oligopoly (5+).
+  \item \textbf{Effective} looks at what the leader actually holds: sole
+        declarant, effective monopoly ($\geq 95\,\%$), dominant leader
+        ($\geq 50\,\%$), or contested.
+\end{itemize}
+
+They disagree, and the disagreement is the finding. PCHIM has three accredited
+declarants --- a ``tight oligopoly'' by any count --- and a leader holding
+essentially the whole market. Both thresholds are named constants so they are
+easy to argue with.
+
+\paragraph{The coverage trap.} Filières enter the SYDEREP reporting system at
+different dates: PNEU from 2017, EEE from 2019, ABJ from 2023. A filière with
+zero declarants in a year is \emph{not} a market with no suppliers --- it is a
+market not yet reporting. Every function returns only reported filière-years,
+and the charts render the rest as blank. Reading a blank as a zero is the
+easiest mistake to make with this dataset.
+
+\paragraph{Entry and exit} are measured inside each filière's \emph{own}
+reporting window. A body present in the filière's first reported year is the
+incumbent at the point the record begins, not an entrant. Measuring against the
+dataset's overall window would invent a wave of entries in whichever year each
+filière joined the system.
+
+\subsection{\file{lib/targets.py} --- the comparison schema}
+
+The point of this module is the schema, not the numbers.
+
+Each row carries \emph{both} a verbatim \file{metric} (as the instrument words
+it) and a normalised \file{metric\_family} (how we choose to group it), plus an
+explicit \file{basis} string and a \file{comparable} flag.
+\file{metric\_family} is our editorial judgement, not the law's --- it is the
+honest place for the comparison to be contestable, and it lives in a
+module-level list so it is easy to change.
+
+\paragraph{The pairing rule.} \file{paired()} matches on \file{sector} alone,
+deliberately \emph{not} on (sector, metric\_family). France measures packaging
+as a recycling rate and Brazil as reverse-logistics recovery, so keying on both
+fields matches nothing and the chart comes up empty --- hiding the very
+comparison the page exists for. Instead:
+
+\begin{enumerate}
+  \item if both countries share a metric family for that sector, restrict to it
+        and take the furthest horizon within it;
+  \item otherwise fall back to the furthest horizon overall and set
+        \file{cross\_family}, so the chart can warn that the two bars measure
+        different quantities. That is a stronger warning than a basis mismatch.
+\end{enumerate}
+
+\paragraph{A boolean trap worth remembering.} \file{comparable} was originally
+parsed with \file{Series.astype(bool)}. If a single row breaks the strict
+\file{TRUE}/\file{FALSE} pattern --- a \file{no}, an \file{n/a}, a blank ---
+pandas reads the column as text, and \file{astype(bool)} makes \emph{every
+non-empty string} \file{True}, including the literal \file{"false"}. Every pair
+would have been silently marked as sharing a denominator, which is precisely the
+error the page exists to prevent. It now parses text explicitly and treats
+anything unrecognised as \file{False}, the safe direction.
+
+% ===========================================================================
+\section{The pages}
+
+\subsection{\file{app.py} --- landing page}
+
+Project description, institutional context, and \file{st.page\_link} buttons to
+the three pages. No data access, so it always loads even when the data sources
+are misconfigured.
+
+\subsection{\file{2\_targets.py} --- France vs Brazil targets}
+
+Two sections, mirroring how the two countries legislate.
+
+\textbf{Section 1, government targets.} France: EU directives transposed
+nationally, plus the loi AGEC, plus regional plans. Brazil: the PNRS framing
+law, the Planares national plan, and state plans. Two charts:
+
+\begin{itemize}
+  \item \emph{When each commitment bites} --- a dumbbell from baseline year to
+        target year. This is the only chart on the page with \textbf{no}
+        comparability caveat, because time is genuinely shared even when the
+        metrics are not. It surfaces something the numbers cannot: France's
+        commitments cluster at 2025--2035, Brazil's stretch to 2040.
+  \item \emph{Distance still to travel} --- bullet bars where each row is scored
+        against \emph{its own} target only, so no cross-country axis comparison
+        is implied.
+\end{itemize}
+
+\textbf{Section 2, sector-specific targets.} France's per-filière obligations
+are market-wide and mandatory; Brazil's \emph{acordos setoriais} bind signatory
+firms. That difference is structural and survives any amount of data cleaning.
+
+Markers used in the paired chart:
+
+\begin{itemize}
+  \item $\neq$ --- the two countries measure this sector on different
+        denominators;
+  \item $\triangle$ --- they do not even measure the same quantity, so there is
+        no shared metric family to pair on. Read those as ``both regulate this
+        sector'', never as ``one is ahead''.
+\end{itemize}
+
+\paragraph{Provenance is a first-class feature.} A meter at the top reports what
+share of rows carry \file{status = verified}. The \file{status} field has three
+values: \file{placeholder} (invented, layout only), \file{sourced} (real,
+cited, but not read in the primary legal text) and \file{verified} (read in the
+instrument's own text). Only the last counts. The middle value exists because
+``placeholder'' would misdescribe a row that is real but second-hand, and
+``verified'' would overclaim it.
+
+\subsection{\file{3\_EPR.py} --- EPR market structure}
+
+Reads the put-on-market declarations as an industrial-organisation problem: how
+much choice does a producer actually have?
+
+\begin{itemize}
+  \item \textbf{A} --- headline counts: single-declarant filières, effective
+        monopolies, median leader share, genuinely contested filières.
+  \item \textbf{B} --- structure map, filière $\times$ year, on the ordinal ramp
+        with monopoly darkest. EEE's staircase reads at a glance: monopoly
+        (2019) $\rightarrow$ duopoly (2020) $\rightarrow$ tight oligopoly (2021)
+        $\rightarrow$ broad oligopoly (2022).
+  \item \textbf{C} --- the chart that does the real work: each filière split
+        into leader / 2nd / 3rd / all others, sorted by leader share, with the
+        declarant count in brackets. This is where nominal and effective
+        structure visibly diverge.
+  \item \textbf{D} --- a transition log and an entry/exit dot chart.
+  \item \textbf{E} --- one filière in detail: share bands over time, and a
+        timeline of which declarants were active when.
+  \item \textbf{F} --- operators spanning several filières. Single-filière views
+        hide the bodies accredited across many at once.
+  \item \textbf{G} --- route to market, from the \file{statut\_prod} field.
+\end{itemize}
+
+\subsection{\file{4\_France\_EPR.py} --- filière detail}
+
+Reading order: status $\rightarrow$ trajectory $\rightarrow$ mechanism
+$\rightarrow$ territory. Headline tiles, a gap-to-target bullet chart, indexed
+trajectories as small multiples, treatment composition on the waste-hierarchy
+ramp, eco-organisme shares, domestic versus exported treatment, and a schematic
+tile map by region.
+
+Two honest limits are stated on the page itself. Every rate here is
+\file{treated mass / tonnage put on market}, a proxy, because the separate
+collection dataset is not among the extracts. And the target values in the
+gap chart are placeholders held in \file{lib/data.PLACEHOLDER\_TARGETS}.
+
+\paragraph{Why the map is a tile grid, not a choropleth.} Every région gets
+equal area, so colour is not biased by territory size and Île-de-France does not
+vanish beside Nouvelle-Aquitaine. The value is printed in each tile, so colour
+never carries the information alone. It also handles the overseas régions
+without the usual inset awkwardness --- relevant, because their collection rates
+are markedly lower.
+
+% ===========================================================================
+\section{The data files}
+
+\subsection{\file{REP.csv} --- put on market}
+
+29{,}485 rows, 2017--2024, 18 filières. One row per declaring actor per filière
+per year. Key columns: \file{annee}, \file{filiere}, \file{acteur},
+\file{statut\_prod}, \file{quantite}, \file{tonnage}.
+
+\file{acteur} is a code such as \file{FR000017}; \file{Referentiels\_MSM.xlsx}
+maps it to a company name. The declarants are a mix of eco-organismes and
+individual systems, and both are kept: an individual system is a genuine
+alternative to joining a collective body, so excluding them would overstate
+concentration.
+
+\subsection{\file{traitements\_REP.csv} --- treated waste}
+
+34{,}971 rows. \textbf{Semicolon-separated}, unlike \file{REP.csv}. Adds
+\file{typ\_trt} (73 treatment codes, including legacy variants),
+\file{reg\_site\_trt}, \file{dep\_site\_trt} and \file{pays\_site\_trt}.
+
+Two things to hold on to. First, the location fields refer to where waste was
+\textbf{treated}, not collected --- a région with high treated tonnage has
+treatment plants, not necessarily good collection. Second, the 73 treatment
+codes are mapped to four waste-hierarchy buckets by ordered prefix rules in
+\file{lib/data.\_RULES}; anything unmatched shows as \emph{Unclassified} rather
+than being folded into a bucket. If that share is large, fix the rules before
+trusting the composition chart.
+
+TLC's 2024 treatment is entirely \file{TRI\_INCONNUE} --- sorted, destination
+unknown. It renders as a full grey Unclassified bar. That is the data telling
+you something real about textile traceability, not a mapping failure.
+
+\subsection{\file{targets\_fr\_br.csv} --- the targets}
+
+194 rows, 19 columns, every row carrying a source URL. 79 government-level and
+115 sector-level; 66\,\% marked \file{verified}. This is the one data file
+committed to the repository, for the reason given in Section~\ref{sec:sources}. See
+Appendix~\ref{sec:schema} for the column specification and
+\file{docs/targets\_csv\_schema.md} for the full version.
+
+Notable content: for France, the EU directives (Waste Framework, Landfill,
+Packaging including all six per-material targets, Single-Use Plastics, WEEE,
+Batteries, ELV, PPWR), the loi AGEC, décret 3R, and the REP \emph{cahiers des
+charges} for nine filières. For Brazil, Planares Metas 1--9 with their
+2024/2028/2032/2036/2040 trajectories, the staggered \emph{lixão} deadlines, and
+the reverse-logistics instruments for plastics, EEE, tyres, lubricants, lamps,
+medicines and agrochemicals.
+
+\paragraph{Three caveats carried in the file itself.}
+\begin{itemize}
+  \item The Planares metas were transcribed from documents reproducing the
+        decree's annex, not read in the annex itself. The 2040 endpoints are
+        corroborated; the intermediate years are the weakest cells.
+  \item Brazil's two national data sources disagree systematically. SINISA puts
+        recovery at 1.82\,\% (2023); ABREMA at 8.7\,\% (2024). The gap is
+        structural --- ABREMA imputes the tonnage handled by roughly 700{,}000
+        informal \emph{catadores}, which SINISA cannot see. Both are carried as
+        separate rows rather than picking one.
+  \item \textbf{Not one pair shares a denominator.} \file{comparable} is
+        \file{FALSE} on all 194 rows. That is a finding, not an omission.
+\end{itemize}
+
+% ===========================================================================
+\section{Design rules that recur}
+
+Five rules show up across every page. They are worth stating once.
+
+\begin{enumerate}
+  \item \textbf{Blank is not zero.} Missing data renders as an empty cell, never
+        as a zero bar. Both heatmaps had to be fixed for this: one printed the
+        literal \file{NaN}, the other the literal \file{null}.
+  \item \textbf{Name the denominator.} Every rate carries a \file{basis} string
+        in words. Two percentages may only share an axis when their bases match.
+  \item \textbf{Say what is missing.} When a filière drops out of a ranking for
+        want of data, the page names it. A row that silently vanishes reads as
+        ``not applicable'' rather than ``no data''.
+  \item \textbf{Distinguish absence from zero in the data model too.} Brazil has
+        \emph{no} battery collection target; the CSV records that explicitly
+        rather than leaving the cell blank and letting the reader infer.
+  \item \textbf{Sub-1\,\% is not 0\,\%.} An operator present with 0.3\,\% of a
+        filière is present. Those cells read \file{<1\%}.
+\end{enumerate}
+
+% ===========================================================================
+\section{Known limitations and next steps}
+
+\begin{itemize}
+  \item \textbf{No collection dataset.} Every rate on the France page is
+        \file{treated / put on market}, a proxy. ADEME publishes \emph{REP ---
+        Tonnages issus des lieux de collecte} separately; adding it would make
+        the rates real and let the gap-to-target chart use published rates
+        rather than a computed proxy.
+  \item \textbf{The gap-to-target values are placeholders.} They live in
+        \file{lib/data.PLACEHOLDER\_TARGETS} and should be replaced with the
+        published figures from the ADEME filière fact sheets --- most of which
+        are now in \file{targets\_fr\_br.csv} and could be read from there
+        instead.
+  \item \textbf{Nothing is municipal.} Per the project's granularity rule, the
+        finest available level is \file{dep\_site\_trt}, the department of the
+        \emph{treatment site}. Municipal analysis would need a different source.
+  \item \textbf{Dark mode is partial.} Charts and cards follow the toggle;
+        Streamlit's own widgets do not (Section~\ref{sec:model}).
+  \item \textbf{Brazil's side has no equivalent to the French filière data.}
+        The targets page compares commitments; there is no Brazilian counterpart
+        to \file{REP.csv} in the project yet, so the market-structure analysis
+        is France-only.
+  \item \textbf{Pre-signed URLs expire.} If the deployed app works today and
+        returns 403 next week, that is the first thing to check.
+\end{itemize}
+
+\newpage
+% ===========================================================================
+\appendix
+\section{Targets CSV schema}\label{sec:schema}
+
+Plain CSV, comma-separated, UTF-8, one header row, 19 columns in any order. Save
+from Excel as ``CSV UTF-8 (Comma delimited)'' --- a French or Portuguese locale
+defaults to semicolons, which breaks the read.
+
+\begin{longtable}{@{}rL{3.1cm}L{2.0cm}L{7.0cm}@{}}
+\toprule
+\textbf{\#} & \textbf{Column} & \textbf{Required} & \textbf{Notes} \\
+\midrule
+\endhead
+1 & \file{country} & yes & \file{France} or \file{Brazil} exactly. Any other
+value rejects the whole file \\
+2 & \file{level} & yes & \file{government} or \file{sector}, lowercase. Chooses
+the page section \\
+3 & \file{tier} & no & e.g. \file{EU}, \file{National}, \file{Federal},
+\file{Sector agreement} \\
+4 & \file{sector} & no & \textbf{The pairing key.} Must match exactly between
+the two countries \\
+5 & \file{metric\_family} & no & One of the six normalised families \\
+6 & \file{metric} & no & The metric as the instrument words it \\
+7 & \file{basis} & no & \textbf{The denominator, in words.} Load-bearing \\
+8 & \file{unit} & for charts & \file{\%}, \file{Mt}, \file{kg/cap},
+\file{count}. Only \file{\%} rows reach the bar charts \\
+9--14 & the six numeric fields & no & \file{baseline\_value/year},
+\file{latest\_value/year}, \file{target\_value/year} \\
+15 & \file{instrument} & no & Cite the instrument, not a summary \\
+16 & \file{comparable} & no & \file{TRUE}/\file{FALSE}. Anything unrecognised
+is treated as \file{FALSE} \\
+17 & \file{status} & yes & \file{placeholder}, \file{sourced} or
+\file{verified} \\
+18 & \file{note} & no & Caveats, disagreements between sources \\
+19 & \file{source\_url} & no & Where the figure came from \\
+\bottomrule
+\end{longtable}
+
+The six metric families are: Recycling rate; Separate collection rate; Landfill
+diversion; Collection coverage; Reuse \& preparation for reuse;
+Reverse-logistics recovery. A value outside this list is filtered out of the
+page and effectively invisible.
+
+\paragraph{Rejection vs.\ silent coercion.} The loader rejects the whole file
+(falling back to placeholders, with the reason shown in red) if a column is
+missing or \file{country}/\file{level} contains an unexpected value. It does
+\emph{not} reject, but silently blanks, a non-numeric value in a numeric
+column --- so \file{50\%}, \file{\textasciitilde 50} and \file{n/a} all quietly
+become empty. Write bare numbers.
+
+\section{Troubleshooting}
+
+\begin{longtable}{@{}L{5.4cm}L{9.0cm}@{}}
+\toprule
+\textbf{Symptom} & \textbf{Cause and fix} \\
+\midrule
+\endhead
+\file{FileNotFoundError}, message redacted, on the deployed app &
+The data files are not in the deployment. Either commit \file{data/} or
+configure the secrets URLs (Section~\ref{sec:sources}). The pages now catch this
+and print which file is missing \\
+\addlinespace
+Targets page shows the placeholder banner &
+No \file{targets\_fr\_br.csv} found locally and no \file{targets\_url} in
+secrets \\
+\addlinespace
+Red ``found but rejected'' banner &
+A column is missing, or \file{country}/\file{level} has an unexpected value.
+The message names the problem \\
+\addlinespace
+Charts render white in dark mode &
+A \file{st.plotly\_chart} call is missing \file{theme=None}, or the figure does
+not set \file{paper\_bgcolor} explicitly \\
+\addlinespace
+A control appears below the charts it drives &
+It was declared after \file{st.columns()}. Move it above the column split \\
+\addlinespace
+Deployed app returns 403 on data &
+A pre-signed URL has expired. Regenerate it and update the secrets \\
+\addlinespace
+A filière is missing from a chart &
+Check the caption underneath --- pages name what they dropped and why \\
+\bottomrule
+\end{longtable}
+
+\end{document}

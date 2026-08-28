@@ -16,9 +16,9 @@ import sys
 from pathlib import Path
 
 import streamlit as st
-
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lib import theme as T  # noqa: E402
+
 
 st.set_page_config(page_title="Circularity dashboard - Brazil and France", layout="wide")
 T.register_templates()

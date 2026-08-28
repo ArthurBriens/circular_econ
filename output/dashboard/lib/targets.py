@@ -52,8 +52,40 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+from . import data as _data
+
+
+_TRUE = {"true", "yes", "y", "1", "oui", "sim", "vrai"}
+_FALSE = {"false", "no", "n", "0", "non", "nao", "não", "faux", ""}
+
+
+def _truthy(value) -> bool:
+    """Parse a spreadsheet boolean without the astype(bool) trap.
+
+    `Series.astype(bool)` on a text column makes EVERY non-empty string True --
+    including the literal "false". One stray "n/a" in the column is enough to
+    turn the whole thing into strings and silently mark every row comparable,
+    which would put mismatched denominators on a shared axis. So parse the text
+    explicitly and treat anything unrecognised as False, the safe direction.
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return False
+    text = str(value).strip().lower()
+    if text in _TRUE:
+        return True
+    if text in _FALSE:
+        return False
+    return False
+
 ROOT = Path(__file__).resolve().parents[3]
-TARGETS_CSV = ROOT / "data" / "raw" / "targets_fr_br.csv"
+
+# The file is optional and resolved the same way as the ADEME extracts: local
+# data/raw first, then a URL in st.secrets["data"]["targets_url"]. Absence is a
+# normal state -- the page falls back to the placeholder set below.
+TARGETS_FILENAME = "targets_fr_br.csv"
+TARGETS_SECRET = "targets_url"
 
 FRANCE, BRAZIL = "France", "Brazil"
 COUNTRIES = [FRANCE, BRAZIL]
@@ -77,9 +109,19 @@ COLUMNS = [
     "target_year",
     "instrument",      # legal instrument / agreement
     "comparable",      # bool: shares a basis with the other country's same family
-    "status",          # placeholder | verified
+    "status",          # placeholder | sourced | verified
     "note",
+    "source_url",      # where the figure came from
 ]
+
+# status values, weakest to strongest:
+#   placeholder -- invented, for layout only
+#   sourced     -- from a real instrument and cited, but not read in the
+#                  primary legal text (secondary source, or a transcription)
+#   verified    -- read in the instrument's own text or on the regulator's
+#                  official page
+# Only `verified` counts towards the meter on the page.
+STATUSES = ["placeholder", "sourced", "verified"]
 
 # normalised families, ordered from most to least cross-comparable
 METRIC_FAMILIES = [
@@ -382,10 +424,11 @@ def load_targets() -> tuple[pd.DataFrame, str, list[str]]:
     if there are any, the placeholder set is used instead, so a malformed CSV
     degrades loudly rather than half-loading.
     """
-    if not TARGETS_CSV.exists():
+    handle = _data.resolve_optional(TARGETS_FILENAME, TARGETS_SECRET)
+    if handle is None:
         return _placeholder_frame(), "placeholder", []
 
-    df = pd.read_csv(TARGETS_CSV)
+    df = pd.read_csv(handle)
     problems: list[str] = []
 
     missing = [c for c in COLUMNS if c not in df.columns]
@@ -403,7 +446,7 @@ def load_targets() -> tuple[pd.DataFrame, str, list[str]]:
     if problems:
         return _placeholder_frame(), "placeholder", problems
 
-    df["comparable"] = df["comparable"].astype(bool)
+    df["comparable"] = df["comparable"].map(_truthy)
     for c in ("baseline_value", "latest_value", "target_value",
               "baseline_year", "latest_year", "target_year"):
         df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -422,16 +465,45 @@ def paired(df: pd.DataFrame, level: str) -> pd.DataFrame:
     reverse-logistics recovery, so keying on both fields matches nothing and the
     chart comes up empty -- which hides the very comparison the page is for.
 
-    Instead each side keeps its own metric_family and basis, both are returned,
-    and `same_basis` stays False unless the two genuinely coincide. The chart's
-    job is then to show that France and Brazil both regulate packaging while
-    counting something different, rather than to pretend one of those is true.
+    WHICH row represents a sector matters. Taking the furthest-horizon row
+    regardless of family produced nonsense pairs: France's longest-dated EEE
+    target is a 2 % reuse obligation, which is not the thing to set beside
+    Brazil's 17 % collection target. So:
+
+      1. if the two countries share a metric_family for that sector, restrict
+         to it and take the furthest horizon within it -- the closest to
+         like-for-like the data allows;
+      2. otherwise fall back to the furthest horizon overall and set
+         `cross_family`, so the chart can say the two bars measure different
+         things. That is a stronger warning than a basis mismatch: the
+         denominators differ AND so does the quantity being counted.
     """
     sel = df[(df["level"] == level) & (df["unit"] == "%")].copy()
     if sel.empty:
         return sel.head(0)
 
-    # furthest-horizon target per country/sector
+    keep = []
+    cross = {}
+    for sector, grp in sel.groupby("sector"):
+        fams = {c: set(g["metric_family"].dropna())
+                for c, g in grp.groupby("country")}
+        if not all(c in fams for c in COUNTRIES):
+            continue
+        shared = fams[FRANCE] & fams[BRAZIL]
+        if shared:
+            # most cross-comparable shared family, by METRIC_FAMILIES order
+            fam = min(shared, key=lambda f: METRIC_FAMILIES.index(f)
+                      if f in METRIC_FAMILIES else 99)
+            sub = grp[grp["metric_family"] == fam]
+            cross[sector] = False
+        else:
+            sub = grp
+            cross[sector] = True
+        keep.append(sub)
+
+    if not keep:
+        return sel.head(0)
+    sel = pd.concat(keep)
     sel = (sel.sort_values("target_year")
               .drop_duplicates(["country", "sector"], keep="last"))
 
@@ -442,7 +514,6 @@ def paired(df: pd.DataFrame, level: str) -> pd.DataFrame:
     )
     wide.columns = [f"{a}__{b}" for a, b in wide.columns]
 
-    # metric_family and basis are strings, so they need a separate unstack
     meta = sel.set_index(["sector", "country"])[["metric_family", "basis", "comparable"]]
     for field in ("metric_family", "basis", "comparable"):
         col = meta[field].unstack()
@@ -451,7 +522,6 @@ def paired(df: pd.DataFrame, level: str) -> pd.DataFrame:
                 wide[f"{field}__{country}"] = col[country]
 
     wide = wide.reset_index()
-
     need = [f"target_value__{c}" for c in COUNTRIES]
     if any(c not in wide.columns for c in need):
         return wide.head(0)
@@ -468,6 +538,7 @@ def paired(df: pd.DataFrame, level: str) -> pd.DataFrame:
             return False
 
     both["same_basis"] = both.apply(_same, axis=1)
+    both["cross_family"] = both["sector"].map(cross).fillna(True)
     return both
 
 

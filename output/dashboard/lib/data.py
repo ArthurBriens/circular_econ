@@ -22,21 +22,224 @@ a municipal or even a regional collection performance measure.
 
 from __future__ import annotations
 
+import io
+import re
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
 # --------------------------------------------------------------------------
-# paths -- resolved from this file, so the app runs from any working directory
+# where the data comes from
+#
+# Two sources, checked in this order:
+#
+#   1. data/raw/<file>          -- local working copy, used for development
+#   2. st.secrets["data"][...]  -- a URL, used by the deployed app
+#
+# The extracts are deliberately NOT committed to the repository, so a fresh
+# clone (which is what Streamlit Community Cloud builds from) has no data
+# directory at all and falls through to the secrets URL.
+#
+# SECURITY: those URLs are credentials. A pre-signed S3/GCS link or a share
+# link with an embedded token grants whoever holds it read access to the file.
+# So they live in `.streamlit/secrets.toml` (gitignored) locally and in the
+# Streamlit Cloud "Secrets" settings pane in the deployment -- never in git,
+# never in a log line, and never in an error message. `_scrub` below exists to
+# keep them out of exception text, which is the easy way to leak one.
+#
+# Expected secrets shape:
+#
+#   [data]
+#   msm_url = "https://..."   # REP.csv
+#   trt_url = "https://..."   # traitements_REP.csv
+#   ref_url = "https://..."   # Referentiels_MSM.xlsx
 # --------------------------------------------------------------------------
 
 ROOT = Path(__file__).resolve().parents[3]
 RAW = ROOT / "data" / "raw"
 
-MSM_CSV = RAW / "REP.csv"
-TRT_CSV = RAW / "traitements_REP.csv"
-REF_XLSX = RAW / "Referentiels_MSM.xlsx"
+DOWNLOAD_TIMEOUT = 60
+
+
+@dataclass(frozen=True)
+class Source:
+    key: str        # cache key and the name used in messages
+    filename: str   # expected name under data/raw
+    secret: str     # key inside the [data] secrets table
+    label: str      # human description
+
+
+SOURCES = (
+    Source("msm", "REP.csv", "msm_url", "put-on-market declarations"),
+    Source("trt", "traitements_REP.csv", "trt_url", "treated-waste declarations"),
+    Source("ref", "Referentiels_MSM.xlsx", "ref_url", "actor and filiere referentials"),
+)
+BY_KEY = {s.key: s for s in SOURCES}
+
+_URL_RE = re.compile(r"https?://\S+")
+
+
+def _scrub(text: str) -> str:
+    """Strip any URL out of a message before it is shown or logged."""
+    return _URL_RE.sub("<url hidden>", str(text))
+
+
+def _local(src: Source) -> Path:
+    return RAW / src.filename
+
+
+def _secret_url(src: Source) -> str | None:
+    """The configured URL for this source, or None.
+
+    st.secrets raises rather than returning empty when no secrets exist at all,
+    so every access is guarded.
+    """
+    try:
+        value = st.secrets["data"][src.secret]
+    except Exception:
+        return None
+    value = str(value).strip()
+    return value or None
+
+
+@st.cache_data(show_spinner="Fetching data…")
+def _fetch(key: str) -> bytes:
+    """Download one source. Cached on the KEY, never on the URL.
+
+    Caching on the key rather than the URL keeps the credential out of the
+    cache index, and means rotating the URL does not silently orphan a cache
+    entry keyed to the old one.
+    """
+    src = BY_KEY[key]
+    url = _secret_url(src)
+    if not url:
+        raise RuntimeError(f"No URL configured for '{src.key}'.")
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "circular-econ-dashboard"})
+    try:
+        with urllib.request.urlopen(request, timeout=DOWNLOAD_TIMEOUT) as response:
+            return response.read()
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(
+            f"'{src.key}' returned HTTP {exc.code}. If the link is pre-signed it "
+            "may have expired; if it is a share link, check it is set to "
+            "anyone-with-the-link."
+        ) from None
+    except Exception as exc:
+        raise RuntimeError(f"'{src.key}' could not be fetched: "
+                           f"{_scrub(exc)}") from None
+
+
+def _open(key: str):
+    """A path or an in-memory buffer for this source, whichever is available.
+
+    pandas accepts either, so callers do not need to care which one they got.
+    """
+    src = BY_KEY[key]
+    local = _local(src)
+    if local.exists():
+        return local
+    if _secret_url(src):
+        return io.BytesIO(_fetch(key))
+    return None
+
+
+def resolve_optional(filename: str, secret_key: str):
+    """Path or buffer for an OPTIONAL file, or None if it is not available.
+
+    Same local-then-secrets order as the required sources, but absence is a
+    normal state rather than an error -- the targets file is optional because
+    the page falls back to its placeholder set when it is missing.
+    """
+    local = RAW / filename
+    if local.exists():
+        return local
+    try:
+        url = str(st.secrets["data"][secret_key]).strip()
+    except Exception:
+        return None
+    if not url:
+        return None
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "circular-econ-dashboard"})
+    try:
+        with urllib.request.urlopen(request, timeout=DOWNLOAD_TIMEOUT) as response:
+            return io.BytesIO(response.read())
+    except Exception as exc:
+        raise RuntimeError(
+            f"'{secret_key}' could not be fetched: {_scrub(exc)}") from None
+
+
+def data_origin() -> str:
+    """Where the data is being read from, for display in the UI."""
+    local = sum(1 for s in SOURCES if _local(s).exists())
+    if local == len(SOURCES):
+        return "local files"
+    if local == 0:
+        return "remote storage"
+    return "a mix of local files and remote storage"
+
+
+def require_data() -> None:
+    """Check configuration, then prime the loaders, before any chart runs.
+
+    Two jobs, both about failing legibly. Streamlit Community Cloud redacts
+    exception text to avoid leaking data, so an unguarded pandas error reaches
+    the user as "The original error message is redacted" with no clue which
+    file is missing. This surfaces the real problem instead.
+
+    It also PRIMES the loaders rather than only checking paths: a download that
+    401s or times out would otherwise surface deep inside a chart, redacted.
+    Doing it here funnels every failure mode through one readable place.
+
+    Deliberately NOT decorated with @st.cache_data: st.stop() raises a control
+    -flow exception, and caching a function that raises it would poison the
+    cache entry.
+    """
+    unconfigured = [
+        s for s in SOURCES if not _local(s).exists() and not _secret_url(s)
+    ]
+    if unconfigured:
+        rows = "\n".join(
+            f"- **{s.label}** — expected at `data/raw/{s.filename}`, "
+            f"or a URL in secrets under `data.{s.secret}`"
+            for s in unconfigured
+        )
+        st.error(
+            "**No data source is configured.**\n\n"
+            f"{rows}\n\n"
+            "The extracts are deliberately not committed to the repository, so "
+            "the deployed app reads them from private storage instead. Add a "
+            "`[data]` section to the app's secrets:\n\n"
+            "```toml\n[data]\n"
+            'msm_url = "https://…/REP.csv"\n'
+            'trt_url = "https://…/traitements_REP.csv"\n'
+            'ref_url = "https://…/Referentiels_MSM.xlsx"\n'
+            "```\n\n"
+            "On Streamlit Community Cloud: **Manage app → Settings → Secrets**. "
+            "Locally: create `.streamlit/secrets.toml` (already gitignored). "
+            "Pre-signed S3/GCS links, or Drive/Dropbox direct-download links, "
+            "all work — anything the server can GET without a login."
+        )
+        st.stop()
+
+    try:
+        load_msm()
+        load_treatment()
+        load_actors()
+    except Exception as exc:
+        st.error(
+            "**The data could not be loaded.**\n\n"
+            f"{_scrub(exc)}\n\n"
+            "The URLs are configured, so this is a fetch or parse problem "
+            "rather than a missing setting. Check the link has not expired and "
+            "still points at the right file."
+        )
+        st.stop()
 
 
 # --------------------------------------------------------------------------
@@ -178,7 +381,7 @@ REGION_SHORT = {
 @st.cache_data(show_spinner=False)
 def load_msm() -> pd.DataFrame:
     """Put-on-market declarations (REP.csv). One row per declaring actor."""
-    df = pd.read_csv(MSM_CSV, low_memory=False)
+    df = pd.read_csv(_open("msm"), low_memory=False)
     df["filiere_en"] = df["filiere"].map(FILIERE_EN).fillna(df["filiere"])
     return df
 
@@ -186,7 +389,7 @@ def load_msm() -> pd.DataFrame:
 @st.cache_data(show_spinner=False)
 def load_treatment() -> pd.DataFrame:
     """Treated-waste declarations. Semicolon-separated, unlike REP.csv."""
-    df = pd.read_csv(TRT_CSV, sep=";", low_memory=False)
+    df = pd.read_csv(_open("trt"), sep=";", low_memory=False)
 
     # typ_trt is absent for whole filieres (EMPAP declares supported tonnage,
     # not treatment operations). Keep that distinguishable from "code we failed
@@ -217,12 +420,12 @@ def load_treatment() -> pd.DataFrame:
 @st.cache_data(show_spinner=False)
 def load_actors() -> pd.DataFrame:
     """Actor id -> company name."""
-    return pd.read_excel(REF_XLSX, sheet_name="Acteurs")
+    return pd.read_excel(_open("ref"), sheet_name="Acteurs")
 
 
 @st.cache_data(show_spinner=False)
 def load_filieres() -> pd.DataFrame:
-    return pd.read_excel(REF_XLSX, sheet_name="Filieres")
+    return pd.read_excel(_open("ref"), sheet_name="Filieres")
 
 
 # --------------------------------------------------------------------------

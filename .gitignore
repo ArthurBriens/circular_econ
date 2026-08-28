@@ -10,13 +10,31 @@ venv/
 .claude/
 
 # Streamlit
-# secrets.toml must NEVER be committed -- it holds API keys and, if you later
-# add st.login(), the OIDC client secret and cookie secret.
+# secrets.toml must NEVER be committed -- it holds the data-source URLs, which
+# are credentials (a pre-signed link grants read access to whoever holds it).
 # config.toml (theme only, no secrets) SHOULD be committed.
 .streamlit/secrets.toml
 
 # OS
 .DS_Store
+
+# ---------------------------------------------------------------------------
+# Data
+#
+# The line drawn here is third-party bulk extracts OUT, our own research IN.
+#
+# The three ADEME/SYDEREP extracts total ~4.5 MB, are redownloadable from
+# data.ademe.fr at any time, and would grow git history every time they are
+# refreshed. The deployed app gets them from the URLs in st.secrets instead
+# (see secrets.toml.example).
+data/raw/REP.csv
+data/raw/traitements_REP.csv
+data/raw/Referentiels_MSM.xlsx
+
+# data/raw/targets_fr_br.csv is deliberately NOT ignored. It is 84 KB of
+# hand-assembled, individually sourced research rather than a bulk download,
+# and committing it is what makes the targets page reproducible from a clone.
+# ---------------------------------------------------------------------------
 
 # Generated EDA outputs -- regenerable from code/, so kept out of the repo.
 # Delete these two lines if you want the figures versioned.

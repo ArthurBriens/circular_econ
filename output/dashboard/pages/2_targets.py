@@ -30,6 +30,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
@@ -61,8 +62,7 @@ NEUTRAL = "#c3c2b7" if not dark else "#52514e"
 st.markdown(T.page_css(dark), unsafe_allow_html=True)
 
 # colour follows the entity, always the same slot for the same country
-BRAZIL_GREEN = "#009C3B"  # Brazilian flag green
-COUNTRY_COLOUR = {TG.FRANCE: P["series"][0], TG.BRAZIL: BRAZIL_GREEN}
+COUNTRY_COLOUR = {TG.FRANCE: P["series"][0], TG.BRAZIL: P["series"][1]}
 
 
 # theme=None is REQUIRED: st.plotly_chart defaults to theme="streamlit",
@@ -154,18 +154,22 @@ def label_of(r, limit: int = 62) -> str:
     return s if len(s) <= limit else s[: limit - 1] + "…"
 
 
-def horizon_chart(sub, height):
+def horizon_chart(sub, row_px: int = 30):
     """Dumbbell: baseline year -> target year.
 
     Time is the one axis France and Brazil genuinely share. Even when the
     metrics are incomparable, WHEN a commitment bites is directly comparable,
     so this chart carries no comparability caveat.
     """
+    # height is derived AFTER this filter, not from the caller's row count:
+    # most rows carry no baseline year, so sizing on the input length spread a
+    # handful of dumbbells over thousands of empty pixels
     sub = sub.dropna(subset=["baseline_year", "target_year"]).copy()
     if sub.empty:
         return None
     sub["label"] = sub.apply(label_of, axis=1)
     sub = sub.sort_values("target_year")
+    height = 110 + row_px * len(sub)
 
     fig = go.Figure()
     for _, r in sub.iterrows():
@@ -194,15 +198,20 @@ def horizon_chart(sub, height):
     return chart(fig, height)
 
 
-def progress_chart(sub, height):
+def progress_chart(sub, row_px: int = 30):
     """Bullet bars: where the metric stands now, against its own target.
 
     Each row is scored against ITS OWN target, so no cross-country axis
     comparison is implied -- only 'distance travelled', which is legitimate.
     """
+    # percentages ONLY: a count row (1,606 lixoes against a target of 0) or a
+    # kg/inhab row on a 0-100 axis blows out the scale and reads as 1,600 %
+    sub = sub[sub["unit"] == "%"]
+    # same reasoning as horizon_chart: size on the surviving rows
     sub = sub.dropna(subset=["latest_value", "target_value"]).copy()
     if sub.empty:
         return None
+    height = 110 + row_px * len(sub)
     sub["lower_better"] = sub["metric_family"].isin(TG.LOWER_IS_BETTER)
     sub["label"] = sub.apply(
         lambda r: ("↓ " if r["lower_better"] else "") + label_of(r), axis=1)
@@ -259,17 +268,27 @@ else:
     st.caption("Hollow marker = baseline year, filled = target year. Time is "
                "the one axis both countries genuinely share, so this chart "
                "needs no comparability caveat.")
-    fig = horizon_chart(gov, 110 + 30 * len(gov))
+    fig = horizon_chart(gov)
     if fig:
         st.plotly_chart(fig, use_container_width=True, theme=None)
+        drawn = int(gov[["baseline_year", "target_year"]].notna().all(axis=1).sum())
+        st.caption(f"{drawn} of {len(gov)} government targets carry both a "
+                   "baseline year and a target year; the rest are rates rather "
+                   "than changes and cannot be drawn on a time axis.")
 
     st.subheader("Distance still to travel")
     st.caption("Each bar is scored against its own target only, so no "
                "cross-country axis comparison is implied. A down-arrow marks "
                "metrics where a LOWER value is the better outcome.")
-    fig = progress_chart(gov, 110 + 30 * len(gov))
+    fig = progress_chart(gov)
     if fig:
         st.plotly_chart(fig, use_container_width=True, theme=None)
+        drawn = int((gov["unit"].eq("%")
+                     & gov[["latest_value", "target_value"]].notna().all(axis=1)).sum())
+        st.caption(f"{drawn} of {len(gov)} government targets are expressed as a "
+                   "percentage AND have a published latest measured value to "
+                   "score against. Count-based targets (municipalities, MW) are "
+                   "in the table below instead.")
 
     st.markdown("**What each target actually counts**")
     st.caption("The denominator is where a France/Brazil comparison lives or "
@@ -313,16 +332,31 @@ else:
                     "than widening the filters until something appears.")
         else:
             mismatched = int((~pairs["same_basis"]).sum())
+            cross = int(pairs.get("cross_family", pd.Series(dtype=bool)).sum())
             if mismatched:
                 st.caption(
                     f"{mismatched} of {len(pairs)} pairs do NOT share a "
-                    "denominator and are marked with a not-equals sign. Their bars sit "
-                    "on one axis for convenience of reading, not because the "
-                    "numbers mean the same thing."
+                    "denominator and are marked `≠`. Their bars sit on one axis "
+                    "for convenience of reading, not because the numbers mean "
+                    "the same thing."
                 )
-            pairs = pairs.sort_values("same_basis", ascending=False).copy()
-            pairs["label"] = pairs.apply(
-                lambda r: ("" if r["same_basis"] else "≠ ") + r["sector"], axis=1)
+            if cross:
+                st.caption(
+                    f"**{cross} of {len(pairs)} go further: the two countries do "
+                    "not even measure the same quantity** for that sector, so "
+                    "there is no shared metric family to pair on. Those are "
+                    "marked `⚠`. Read them as 'both regulate this sector', never "
+                    "as 'one is ahead'."
+                )
+            pairs = pairs.sort_values(
+                ["cross_family", "same_basis"], ascending=[True, False]).copy()
+
+            def _prefix(r) -> str:
+                if r.get("cross_family"):
+                    return "⚠ "
+                return "" if r["same_basis"] else "≠ "
+
+            pairs["label"] = pairs.apply(lambda r: _prefix(r) + r["sector"], axis=1)
             fig = go.Figure()
             for country in TG.COUNTRIES:
                 col = f"target_value__{country}"
@@ -349,17 +383,18 @@ else:
             st.plotly_chart(chart(fig, 110 + 56 * len(pairs)),
                             use_container_width=True, theme=None)
             st.caption(
-                "A not-equals prefix means the two countries measure this sector on "
-                "different denominators. Hover a bar to see what each side "
+                "`≠` = different denominator. `⚠` = different quantity entirely, "
+                "with no shared metric family. Hover a bar to see what each side "
                 "actually counts."
             )
             st.dataframe(
                 pairs[["sector", f"metric_family__{TG.FRANCE}",
-                       f"metric_family__{TG.BRAZIL}", "same_basis"]]
+                       f"metric_family__{TG.BRAZIL}", "same_basis", "cross_family"]]
                 .rename(columns={"sector": "Sector",
                                  f"metric_family__{TG.FRANCE}": "France measures",
                                  f"metric_family__{TG.BRAZIL}": "Brazil measures",
-                                 "same_basis": "Shared basis"}),
+                                 "same_basis": "Shared basis",
+                                 "cross_family": "Different quantity"}),
                 use_container_width=True, hide_index=True,
             )
 

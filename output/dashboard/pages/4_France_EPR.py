@@ -59,6 +59,8 @@ if not codes:
     st.info("Select at least one filiere in the sidebar.")
     st.stop()
 
+D.require_data()   # readable message if data/raw is missing from the deployment
+
 msm = D.load_msm()
 trt = D.load_treatment()
 actors = D.load_actors()
@@ -81,9 +83,10 @@ def chart(fig: go.Figure, height: int = 320) -> go.Figure:
 
 st.title("France - EPR filieres")
 st.caption(
-    "Extended Producer Responsibility. Source: ADEME / SYDEREP extracts in "
-    "data/raw. Declarations are national by eco-organism; the treatment file "
-    "is resolved to the TREATMENT SITE, not the point of collection."
+    "Extended Producer Responsibility. Source: ADEME / SYDEREP extracts, read "
+    f"from {D.data_origin()}. Declarations are national by eco-organism; the "
+    "treatment file is resolved to the TREATMENT SITE, not the point of "
+    "collection."
 )
 
 # ==========================================================================
